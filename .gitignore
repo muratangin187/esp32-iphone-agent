@@ -22,3 +22,5 @@ hardware/hid_bridge/build/
 hardware/tests/test
 hardware/tests/test.dSYM/
 hardware/tools/out/
+hardware/build_c3/
+hardware/hid_bridge_c3/build/

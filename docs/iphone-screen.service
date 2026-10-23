@@ -1,0 +1,12 @@
+[Unit]
+Description=iPhone screen receiver (UxPlay AirPlay mirroring -> /tmp/iphone/live.jpg)
+After=network-online.target avahi-daemon.service
+
+[Service]
+WorkingDirectory=%h
+ExecStart=%h/.local/share/mise/installs/uv/latest/.mise-bins/uv run %h/Work/esp32-iphone-agent/hardware/tools/phone_screen.py --name "iPhone Agent"
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
