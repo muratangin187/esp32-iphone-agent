@@ -11,7 +11,7 @@
 # bootloader with a 1200-baud touch; a blank board is flashed directly.
 set -euo pipefail
 cd "$(dirname "$0")"
-FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PSRAM=opi,PartitionScheme=default_8MB"
+FQBN="${FQBN:-esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PSRAM=opi,PartitionScheme=default_8MB}"
 ports() { for p in /dev/cu.usbmodem* /dev/ttyACM*; do [[ -e $p ]] && echo "$p"; done; return 0; }
 PORT="" DEFS="" BUILD_ONLY=0
 for a in "$@"; do

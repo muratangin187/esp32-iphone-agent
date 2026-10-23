@@ -12,6 +12,7 @@ void ble_status(const String &json);               // latest wins; sent before a
 size_t ble_video_room();                           // payload bytes per video notify; 0 = nobody listening
 bool ble_video_send(const uint8_t *p, size_t n);   // waits for free buffers; false = gave up
 void ble_unpair();
+bool ble_is_app_conn(uint16_t conn);  // the connection wrote a command or subscribed to reply/status/video
 
 uint16_t ble_mtu();
 uint8_t ble_phy();       // 1 or 2 (Mbit)

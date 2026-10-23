@@ -32,10 +32,11 @@ String board_suffix() {
   return s;
 }
 
+// Eight digits: easy to type on a phone, and the shortest WPA2 allows (8-63 characters). Fewer than 10^8
+// guesses, so this protects against passers-by, not against someone who captures the handshake and cracks it.
 static String randomPass() {
-  const char *abc = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";  // no look-alikes
   String p;
-  for (int i = 0; i < 12; i++) p += abc[esp_random() % strlen(abc)];
+  for (int i = 0; i < 8; i++) p += char('0' + esp_random() % 10);
   return p;
 }
 
@@ -217,6 +218,20 @@ void cfg_set_res(uint16_t w, uint16_t h) {
 }
 
 void cfg_set_fps(uint8_t fps) { prefs.putUChar("fps", fps); }
+
+const char *cfg_hid_mode() {
+  switch (prefs.getUChar("hidm", 0)) {
+    case 1: return "ble";
+    case 2: return "usb";
+    default: return "auto";
+  }
+}
+
+bool cfg_set_hid_mode(const String &m) {
+  if (m != "auto" && m != "ble" && m != "usb") return false;
+  prefs.putUChar("hidm", m == "ble" ? 1 : m == "usb" ? 2 : 0);
+  return true;
+}
 
 void cfg_ed25519_seed(uint8_t seed[32]) {
   if (prefs.getBytes("ed_seed", seed, 32) == 32) return;

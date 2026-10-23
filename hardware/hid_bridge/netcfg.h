@@ -21,5 +21,9 @@ uint16_t cfg_height();
 uint8_t cfg_fps();
 void cfg_set_res(uint16_t w, uint16_t h);
 void cfg_set_fps(uint8_t fps);
+// Which path HID commands take to the phone: "auto" (USB when the phone mounted the board, else Bluetooth),
+// "ble" (Bluetooth only: the board is plugged into a computer, whose USB HID must never be driven), "usb".
+const char *cfg_hid_mode();
+bool cfg_set_hid_mode(const String &mode);
 void cfg_ed25519_seed(uint8_t seed[32]);  // created once, stable across boots
 String board_suffix();                    // "1A2B": last two BT MAC bytes

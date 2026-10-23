@@ -1,6 +1,9 @@
 // HID bridge: an ESP32-S3 (XIAO, 8 MB PSRAM) plugged into the iPhone. It is the phone's
 // USB mouse + keyboard, an AirPlay screen-mirroring receiver, and a BLE peripheral for the
 // iOS app on the same phone. It holds no logic; the app decides. Protocol: docs/ble-protocol.md.
+// Where the phone cannot host the board over USB (a Lightning iPhone without a powered camera adapter),
+// the board is also a Bluetooth mouse + keyboard the phone pairs with in Settings > Bluetooth (ble_hid.cpp).
+// Commands go over USB when the phone has mounted the board, otherwise over Bluetooth HID.
 //
 // HID commands (unchanged from the old TCP protocol, the board answers "ok" or "err <why>"):
 //   ping | home | move <dx> <dy> | press | release | click
@@ -15,6 +18,7 @@
 #include "USBHIDConsumerControl.h"
 #include "tusb.h"
 #include "ble_link.h"
+#include "ble_hid.h"
 #include "netcfg.h"
 #include "video_link.h"
 #include "src/airplay/airplay.h"
@@ -33,11 +37,25 @@ USBHIDKeyboard keyboard;
 USBHIDConsumerControl consumer;
 const uint16_t AC_HOME = 0x0223;  // HID consumer page: AC Home
 static String receiverName = "ESP32 Agent";
+static bool fromSerial = false;  // the command being run arrived on USB serial, not over BLE
+
+enum Route { ROUTE_NONE, ROUTE_USB, ROUTE_BLE };
+static Route route = ROUTE_NONE;  // how the command being run reaches the phone; set by run()
+
+void mouseMove(int dx, int dy, int wheel = 0, int pan = 0) {
+  if (route == ROUTE_BLE) ble_hid_mouse_move(dx, dy, wheel, pan);
+  else mouse.move(dx, dy, wheel, pan);
+}
+void mouseButton(bool down) {
+  if (route == ROUTE_BLE) ble_hid_mouse_buttons(down ? HID_BTN_LEFT : 0);
+  else if (down) mouse.press(MOUSE_LEFT);
+  else mouse.release(MOUSE_LEFT);
+}
 
 void movePaced(long dx, long dy) {
   while (dx || dy) {
     int sx = constrain(dx, -STEP, STEP), sy = constrain(dy, -STEP, STEP);
-    mouse.move(sx, sy);
+    mouseMove(sx, sy);
     dx -= sx;
     dy -= sy;
     delay(STEP_MS);
@@ -61,15 +79,29 @@ uint8_t keyCode(const String &k) {
   return k.length() == 1 ? k[0] : 0;
 }
 
+void keysReleaseAll() {
+  if (route == ROUTE_BLE) ble_hid_release_all();
+  else keyboard.releaseAll();
+}
+
 bool pressCombo(String combo) {
   combo += '+';
   for (int i; (i = combo.indexOf('+')) >= 0; combo = combo.substring(i + 1)) {
-    uint8_t c = keyCode(combo.substring(0, i));
+    String name = combo.substring(0, i);
+    if (route == ROUTE_BLE) {
+      uint8_t usage;
+      bool shift;
+      if (!ble_hid_key_usage(name, usage, shift)) { ble_hid_release_all(); return false; }
+      if (shift) ble_hid_press(HID_LSHIFT);
+      ble_hid_press(usage);
+      continue;
+    }
+    uint8_t c = keyCode(name);
     if (!c) { keyboard.releaseAll(); return false; }
     keyboard.press(c);
   }
   delay(30);
-  keyboard.releaseAll();
+  keysReleaseAll();
   return true;
 }
 
@@ -83,6 +115,17 @@ bool usbReady() {
   return tud_mounted() && !tud_suspended();
 }
 
+// USB when the phone has the board mounted, else Bluetooth HID. A locked or sleeping phone suspends USB
+// (usbReady() tries to wake it); a paired phone's Bluetooth link does not depend on it.
+Route pickRoute() {
+  String m = cfg_hid_mode();
+  if (m == "ble") return ble_hid_ready() ? ROUTE_BLE : ROUTE_NONE;
+  if (m == "usb") return usbReady() ? ROUTE_USB : ROUTE_NONE;
+  if (tud_mounted() && !tud_suspended()) return ROUTE_USB;
+  if (ble_hid_ready()) return ROUTE_BLE;
+  return usbReady() ? ROUTE_USB : ROUTE_NONE;
+}
+
 String run(const String &line) {
   int sp = line.indexOf(' ');
   String cmd = sp < 0 ? line : line.substring(0, sp);
@@ -91,19 +134,28 @@ String run(const String &line) {
   sscanf(arg.c_str(), "%ld %ld", &a, &b);
 
   if (cmd == "ping") return "ok";
-  if (!usbReady()) return "err phone usb asleep (unlock the phone)";
+  route = pickRoute();
+  if (route == ROUTE_NONE) return "err phone hid not connected (usb asleep, or pair the board in Settings > Bluetooth)";
   if (cmd == "home") {  // slam the pointer into the top-left corner
-    for (int i = 0; i < HOME_REPORTS; i++) { mouse.move(-127, -127); delay(2); }
+    for (int i = 0; i < HOME_REPORTS; i++) { mouseMove(-127, -127); delay(route == ROUTE_BLE ? STEP_MS : 2); }
     return "ok";
   }
   if (cmd == "move") { movePaced(a, b); return "ok"; }
-  if (cmd == "press") { mouse.press(MOUSE_LEFT); return "ok"; }
-  if (cmd == "release") { mouse.release(MOUSE_LEFT); return "ok"; }
-  if (cmd == "click") { mouse.press(MOUSE_LEFT); delay(60); mouse.release(MOUSE_LEFT); return "ok"; }
-  if (cmd == "scroll") { mouse.move(0, 0, a, b); return "ok"; }
-  if (cmd == "type") { keyboard.print(arg); return "ok"; }
+  if (cmd == "press") { mouseButton(true); return "ok"; }
+  if (cmd == "release") { mouseButton(false); return "ok"; }
+  if (cmd == "click") { mouseButton(true); delay(60); mouseButton(false); return "ok"; }
+  if (cmd == "scroll") { mouseMove(0, 0, a, b); return "ok"; }
+  if (cmd == "type") {
+    if (route == ROUTE_BLE) ble_hid_type(arg);
+    else keyboard.print(arg);
+    return "ok";
+  }
   if (cmd == "key") return pressCombo(arg) ? "ok" : "err unknown key";
-  if (cmd == "homescreen") { consumer.press(AC_HOME); delay(40); consumer.release(); return "ok"; }
+  if (cmd == "homescreen") {
+    if (route == ROUTE_BLE) { ble_hid_consumer(AC_HOME); delay(40); ble_hid_consumer(0); }
+    else { consumer.press(AC_HOME); delay(40); consumer.release(); }
+    return "ok";
+  }
   return "err unknown command";
 }
 
@@ -124,6 +176,13 @@ const char *usbState() {
   return tud_suspended() ? "asleep" : "ok";
 }
 
+// Which HID path the next command would take: usb | ble | off
+const char *hidState() {
+  if (!strcmp(cfg_hid_mode(), "ble")) return ble_hid_ready() ? "ble" : "off";
+  if (tud_mounted() && !tud_suspended()) return "usb";
+  return ble_hid_ready() ? "ble" : "off";
+}
+
 // Board-level commands from the app; everything else is an HID command for run().
 String board(const String &line, const String &id) {
   int sp = line.indexOf(' ');
@@ -133,15 +192,21 @@ String board(const String &line, const String &id) {
   int n = sscanf(arg.c_str(), "%ld %ld", &a, &b);
   if (cmd == "stream") {
     if (arg != "on" && arg != "off") return "err usage: stream on|off";
-    video_stream(arg == "on");
+    video_stream(arg == "on", fromSerial);
     return "ok";
+  }
+  if (cmd == "status") return statusJson(true);  // BLE gets this once a second; serial asks for it
+  if (cmd == "hid") {  // which path HID commands take: auto | ble | usb (stored)
+    if (arg.length() && !cfg_set_hid_mode(arg)) return "err usage: hid auto|ble|usb";
+    return String("ok ") + cfg_hid_mode();
   }
   if (cmd == "app" || cmd == "log") {  // debug relay: Mac -> app ("app run ...") and app -> Mac ("log ...")
     ble_reply(cmd + " " + arg);         // every peer sees it; each side ignores lines it doesn't handle
     return "ok";
   }
-  if (cmd == "snap") { video_snap(id); return ""; }  // replies when the GOP is sent
+  if (cmd == "snap") { video_snap(id, fromSerial); return ""; }  // replies when the GOP is sent
   if (cmd == "bench") {
+    if (fromSerial) return "err bench measures BLE";
     if (n < 1 || a <= 0 || a > 4096) return "err usage: bench KB (1-4096)";
     video_bench(id, a);
     return "";
@@ -173,13 +238,13 @@ String board(const String &line, const String &id) {
 String statusJson(bool full) {
   static const char *apStates[] = {"idle", "connected", "streaming"};
   VideoStats v = video_stats();
-  char s[384];
+  char s[416];
   snprintf(s, sizeof s,
-           "{\"up\":%lu,\"rst\":\"%s\",\"heap\":%u,\"psram\":%u,\"usb\":\"%s\",\"net\":\"%s\",\"ip\":\"%s\",\"sta\":%d,"
+           "{\"up\":%lu,\"rst\":\"%s\",\"heap\":%u,\"psram\":%u,\"usb\":\"%s\",\"hid\":\"%s\",\"net\":\"%s\",\"ip\":\"%s\",\"sta\":%d,"
            "\"ap\":\"%s\",\"w\":%u,\"h\":%u,\"kbps\":%lu,\"fps\":%.1f,\"idr\":%lu,\"gop\":%lu,"
            "\"ble\":{\"mtu\":%u,\"phy\":%u,\"kbps\":%lu,\"drop\":%lu,\"rdrop\":%lu,\"n\":%d}}",
            millis(), resetReason(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), usbState(), net_mode(), net_ip().c_str(), net_peers(),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), usbState(), hidState(), net_mode(), net_ip().c_str(), net_peers(),
            apStates[airplay_state()], cfg_width(), cfg_height(), (unsigned long)v.kbps, v.fps, (unsigned long)v.idr_ms,
            (unsigned long)v.gop_bytes, ble_mtu(), ble_phy(), (unsigned long)ble_kbps(), (unsigned long)ble_drops(),
            (unsigned long)ble_reply_drops(), ble_peers());
@@ -252,6 +317,7 @@ void loop() {
   if (linked && !ble_connected()) {
     mouse.release(MOUSE_LEFT);  // a gesture cut off mid-way must not leave the button held (long press)
     keyboard.releaseAll();
+    ble_hid_release_everything();
     video_stream(false);
   }
   linked = ble_connected();
@@ -263,7 +329,10 @@ void loop() {
     if (line.startsWith("0 net ")) { net_request(line.substring(6)); Serial.println("0 ok"); return; }
     int sp = line.indexOf(' ');
     String id = sp < 0 ? line : line.substring(0, sp);
-    Serial.println(id + " " + board(sp < 0 ? "" : line.substring(sp + 1), id));
+    fromSerial = true;
+    String reply = board(sp < 0 ? "" : line.substring(sp + 1), id);
+    fromSerial = false;
+    if (reply.length()) serial_line(id + " " + reply);  // snap replies later, from the video task
     return;
   }
   if (!ble_pop_cmd(line, 50)) return;

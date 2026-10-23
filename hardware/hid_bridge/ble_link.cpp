@@ -12,11 +12,13 @@
 #include <NimBLEDevice.h>
 #include "nimble/nimble/host/include/host/ble_hs.h"
 #include "netcfg.h"
+#include "ble_hid.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
               "nimble_cfg.h not applied: build with hardware/flash.sh");
 static_assert(MYNEWT_VAL(MSYS_2_BLOCK_COUNT) == 0 && MYNEWT_VAL(BLE_TRANSPORT_ACL_FROM_LL_COUNT) == 24, "nimble_cfg.h");
 static_assert(MYNEWT_VAL(BLE_ATT_PREFERRED_MTU) == 517 && MYNEWT_VAL(BLE_HS_LOG_LVL) == 5, "nimble_cfg.h");
+static_assert(MYNEWT_VAL(BLE_MAX_CONNECTIONS) >= 3, "the app, a Mac and the phone's HID link");
 static_assert(MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) == 1 && MYNEWT_VAL(BLE_L2CAP_COC_MPS) == 247, "nimble_cfg.h");
 
 #define UUID(s) "6e400001-a9e8-4b1b-9c39-6d6f8a3c" s
@@ -29,8 +31,9 @@ const int MBUF_RESERVE = 16;               // of 64 msys blocks; video never tak
 const int VIDEO_CTRL_PKTS = 8;             // ACL packets video may have in the controller while commands flow
 const uint32_t CMD_ACTIVE_MS = 1000;       // ... i.e. for this long after a `cmd` write; otherwise all of them
 const int MBUF_DATA = MYNEWT_VAL(MSYS_1_BLOCK_SIZE) - 16;  // payload per block (16 B mbuf header)
-// Up to MAX_PEERS centrals at once: the phone's app, plus a Mac as a debug harness.
-const int MAX_PEERS = 2;
+// Up to MAX_PEERS centrals at once: the phone's app, plus a Mac as a debug harness, plus the phone's Bluetooth
+// HID link (ble_hid.cpp). The HID link takes a slot but is not an app peer: no commands, no video, no MTU vote.
+const int MAX_PEERS = 3;
 
 enum { CH_REPLY, CH_STATUS, CH_VIDEO, CH_COUNT };
 
@@ -48,6 +51,7 @@ static bool statusDirty;
 static std::atomic<int> ctrlPending;  // replies queued or sending + a status waiting; video yields to them
 static volatile int peers[MAX_PEERS] = {-1, -1};
 static volatile bool subscribed[MAX_PEERS][CH_COUNT];
+static volatile bool appUsed[MAX_PEERS];  // wrote a command or subscribed to an app characteristic
 static uint32_t winStart, winBytes;  // touched by the video task only
 static volatile uint32_t kbps;
 static std::atomic<uint32_t> drops, replyDrops;
@@ -71,14 +75,25 @@ static int slotFor(int h) {
   int i = slotOf(h);
   if (i < 0 && (i = slotOf(-1)) >= 0) {
     for (int c = 0; c < CH_COUNT; c++) subscribed[i][c] = false;
+    appUsed[i] = false;
     peers[i] = h;
   }
   return i;
 }
 
-static int peerCount() {
+// A connection is the phone's HID link only if it subscribed to HID reports and never used the app side
+// (a bonded Linux host's BlueZ subscribes to the HID reports of any board it connects to, and then also talks app).
+static bool isApp(int i) { return peers[i] >= 0 && (appUsed[i] || !ble_hid_peer(peers[i])); }
+
+static int usedSlots() {
   int n = 0;
   for (int i = 0; i < MAX_PEERS; i++) n += peers[i] >= 0;
+  return n;
+}
+
+static int peerCount() {  // app peers: the phone's HID link does not count
+  int n = 0;
+  for (int i = 0; i < MAX_PEERS; i++) n += isApp(i);
   return n;
 }
 
@@ -112,10 +127,11 @@ class ServerCb : public NimBLEServerCallbacks {
     if (slotFor(ci.getConnHandle()) < 0) { s->disconnect(ci.getConnHandle()); return; }
     logConn("connect", ci);
     tuneLink(ci.getConnHandle());
-    if (peerCount() < MAX_PEERS) NimBLEDevice::startAdvertising();  // room for the debug harness
+    if (usedSlots() < MAX_PEERS) NimBLEDevice::startAdvertising();  // room for the debug harness / the phone
   }
   void onDisconnect(NimBLEServer *s, NimBLEConnInfo &ci, int reason) override {
     int i = slotOf(ci.getConnHandle());
+    ble_hid_on_disconnect(ci.getConnHandle());
     if (i >= 0) {
       for (int c = 0; c < CH_COUNT; c++) subscribed[i][c] = false;
       peers[i] = -1;
@@ -140,6 +156,8 @@ class CharCb : public NimBLECharacteristicCallbacks {
     v.trim();
     strncpy(line, v.c_str(), CMD_MAX - 1);
     lastCmdMs = millis();
+    int p = slotFor(ci.getConnHandle());
+    if (p >= 0) appUsed[p] = true;
     if (line[0]) xQueueSend(cmdQueue, line, 0);  // full queue: the app times out and retries
   }
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
@@ -150,6 +168,7 @@ class CharCb : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &ci, uint16_t sub) override {
     int i = indexOf(c), p = sub & 1 ? slotFor(ci.getConnHandle()) : slotOf(ci.getConnHandle());
     if (i >= 0 && p >= 0) subscribed[p][i] = sub & 1;
+    if (i >= 0 && p >= 0 && (sub & 1)) appUsed[p] = true;
     BLE_LOG("conn %u: %s %s\n", ci.getConnHandle(), sub & 1 ? "subscribed" : "unsubscribed",
             i == CH_REPLY ? "reply" : i == CH_STATUS ? "status" : "video");
   }
@@ -275,12 +294,15 @@ void ble_begin(const String &name) {
   cmd->setCallbacks(&charCb);
   netChar->setCallbacks(&charCb);
   for (auto *c : chars) c->setCallbacks(&charCb);
+  ble_hid_begin(server);  // after our own service, so its attribute handles stay where they were
   server->start();
 
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   NimBLEAdvertisementData data, scan;
   data.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
   data.setCompleteServices(NimBLEUUID(UUID("0000")));
+  data.setAppearance(0x03C0);  // generic HID, so the phone lists the board in Settings > Bluetooth
+  data.addServiceUUID(NimBLEUUID((uint16_t)0x1812));
   scan.setName(name.c_str());
   adv->setAdvertisementData(data);
   adv->setScanResponseData(scan);
@@ -294,6 +316,11 @@ void ble_begin(const String &name) {
 }
 
 bool ble_connected() { return peerCount() > 0; }
+
+bool ble_is_app_conn(uint16_t conn) {
+  int i = slotOf(conn);
+  return i >= 0 && appUsed[i];
+}
 
 bool ble_pop_cmd(String &line, uint32_t wait_ms) {
   char buf[CMD_MAX];
@@ -348,7 +375,7 @@ int ble_peers() { return peerCount(); }
 uint16_t ble_mtu() {  // the smallest peer's, so one notify fits everyone
   uint16_t mtu = 0;
   for (int i = 0; i < MAX_PEERS; i++) {
-    int h = peers[i];
+    int h = isApp(i) ? peers[i] : -1;
     uint16_t m = h >= 0 ? server->getPeerMTU(h) : 0;
     if (m && (!mtu || m < mtu)) mtu = m;
   }
@@ -357,7 +384,9 @@ uint16_t ble_mtu() {  // the smallest peer's, so one notify fits everyone
 
 uint8_t ble_phy() {
   uint8_t tx = 1, rx = 1;
-  int h = peers[0] >= 0 ? peers[0] : peers[1];
+  int h = -1;
+  for (int i = 0; i < MAX_PEERS && h < 0; i++)
+    if (isApp(i)) h = peers[i];
   if (h >= 0) ble_gap_read_le_phy(h, &tx, &rx);
   return tx == BLE_GAP_LE_PHY_2M ? 2 : 1;
 }

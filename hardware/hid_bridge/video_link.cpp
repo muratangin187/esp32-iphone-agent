@@ -15,6 +15,7 @@ struct Req {
   char id[16];
   uint32_t kb;
   bool bench;
+  bool serial;
 };
 
 static gop_buf gop;
@@ -22,15 +23,39 @@ static SemaphoreHandle_t lock;
 static uint8_t *scratch;
 static QueueHandle_t reqs;
 static TaskHandle_t task;
-static volatile bool streaming;
+static volatile bool streaming, streamSerial;
+static SemaphoreHandle_t serialLock;
 static uint16_t seq;
 static uint8_t chunk[VCHUNK_HDR + MAX_CHUNK];
 static uint32_t winStart, winBytes, winFrames, lastIdr;
 static volatile uint32_t statKbps, statIdrMs, statAt;
 static volatile float statFps;
 
+void serial_line(const String &line) {
+  xSemaphoreTake(serialLock, portMAX_DELAY);
+  Serial.println(line);
+  xSemaphoreGive(serialLock);
+}
+
+// One access unit on USB serial as a single frame (see video_link.h). Holds the serial lock for the whole frame
+// so a reply line cannot land inside it; false if the host stopped reading.
+static bool sendAuSerial(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
+  if (!Serial) return false;
+  xSemaphoreTake(serialLock, portMAX_DELAY);
+  Serial.printf("video %u %lu %u\n", flags, (unsigned long)ts, (unsigned)n);
+  bool ok = true;
+  for (size_t off = 0; off < n && ok;) {
+    size_t w = Serial.write(p + off, min((size_t)4096, n - off));
+    if (!w) ok = false;
+    off += w;
+  }
+  xSemaphoreGive(serialLock);
+  return ok;
+}
+
 // One access unit as notifies. A failed chunk still consumes its seq, so the app sees a gap.
-static bool sendAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
+static bool sendAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts, bool serial = false) {
+  if (serial) return sendAuSerial(p, n, flags, ts);
   size_t room = min(ble_video_room(), MAX_CHUNK);
   if (room < 5) return false;
   vchunk c;
@@ -67,20 +92,20 @@ static bool snapshot(uint32_t *gen, int *n, uint8_t *cfg, size_t *cfg_len, uint3
   return *n > 0 && *cfg_len > 0;
 }
 
-static String doSnap() {
+static String doSnap(bool serial) {
   static uint8_t cfg[GOP_CFG_MAX];
-  if (!ble_video_room()) return "err video not subscribed";
+  if (serial ? !Serial : !ble_video_room()) return serial ? "err no serial host" : "err video not subscribed";
   for (int attempt = 0; attempt < 3; attempt++) {
     uint32_t gen, cfg_ts;
     size_t cfg_len;
     int n;
     if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts)) return "err no video (start screen mirroring)";
-    if (!sendAu(cfg, cfg_len, VF_CONFIG | VF_SNAP, cfg_ts)) return "err ble send failed";
+    if (!sendAu(cfg, cfg_len, VF_CONFIG | VF_SNAP, cfg_ts, serial)) return "err send failed";
     bool complete = true;
     for (int i = 0; i < n && complete; i++) {
       gop_au au;
       complete = copyAu(gen, i, &au);
-      if (complete && !sendAu(scratch, au.len, VF_SNAP | (au.idr ? VF_IDR : 0), au.ts)) return "err ble send failed";
+      if (complete && !sendAu(scratch, au.len, VF_SNAP | (au.idr ? VF_IDR : 0), au.ts, serial)) return "err send failed";
     }
     if (complete) return "ok";  // else a new IDR replaced the GOP mid-send: start over with it
   }
@@ -112,7 +137,8 @@ static void streamStep() {
   static uint32_t txGen = UINT32_MAX;
   static int next;
   static uint8_t cfg[GOP_CFG_MAX];
-  if (!streaming || !ble_video_room()) {
+  bool serial = streamSerial;
+  if (!streaming || (serial ? !Serial : !ble_video_room())) {
     txGen = UINT32_MAX;  // resend config + whole GOP when streaming resumes
     return;
   }
@@ -123,21 +149,22 @@ static void streamStep() {
   if (gen != txGen) {
     txGen = gen;
     next = 0;
-    if (!sendAu(cfg, cfg_len, VF_CONFIG, cfg_ts)) { txGen = UINT32_MAX; return; }
+    if (!sendAu(cfg, cfg_len, VF_CONFIG, cfg_ts, serial)) { txGen = UINT32_MAX; return; }
   }
   for (gop_au au; next < n && copyAu(gen, next, &au); next++)
-    if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts)) { txGen = UINT32_MAX; return; }
+    if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts, serial)) { txGen = UINT32_MAX; return; }
 }
 
 static void videoTask(void *) {
   for (;;) {
     Req r;
     if (xQueueReceive(reqs, &r, 0) == pdTRUE) {
-      String reply = String(r.id) + " " + (r.bench ? doBench(r.kb) : doSnap());
+      String reply = String(r.id) + " " + (r.bench ? doBench(r.kb) : doSnap(r.serial));
 #if DEBUG_SERIAL
       Serial.println("video: " + reply);  // the reply only goes over BLE; mirror it for serial-driven tests
 #endif
-      ble_reply(reply);
+      if (r.serial) serial_line(reply);
+      else ble_reply(reply);
     }
     streamStep();
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
@@ -151,6 +178,7 @@ bool video_begin() {
   if (!arena || !aus || !scratch) return false;
   gop_init(&gop, arena, GOP_CAP, aus, MAX_AUS);
   lock = xSemaphoreCreateMutex();
+  serialLock = xSemaphoreCreateMutex();
   reqs = xQueueCreate(4, sizeof(Req));
   return xTaskCreatePinnedToCore(videoTask, "video", 6 * 1024, NULL, 2, &task, 1) == pdPASS;
 }
@@ -182,16 +210,22 @@ void video_on_au(const uint8_t *au, size_t len, bool idr) {
   xTaskNotifyGive(task);
 }
 
-void video_stream(bool on) { streaming = on; }
-
-static void request(const String &id, bool bench, uint32_t kb) {
-  Req r = {{0}, kb, bench};
-  strncpy(r.id, id.c_str(), sizeof r.id - 1);
-  if (xQueueSend(reqs, &r, 0) != pdTRUE) ble_reply(id + " err busy");
+void video_stream(bool on, bool serial) {
+  streamSerial = serial;
+  streaming = on;
 }
 
-void video_snap(const String &id) { request(id, false, 0); }
-void video_bench(const String &id, uint32_t kb) { request(id, true, kb); }
+static void request(const String &id, bool bench, uint32_t kb, bool serial) {
+  Req r = {{0}, kb, bench, serial};
+  strncpy(r.id, id.c_str(), sizeof r.id - 1);
+  if (xQueueSend(reqs, &r, 0) != pdTRUE) {
+    if (serial) serial_line(id + " err busy");
+    else ble_reply(id + " err busy");
+  }
+}
+
+void video_snap(const String &id, bool serial) { request(id, false, 0, serial); }
+void video_bench(const String &id, uint32_t kb) { request(id, true, kb, false); }
 
 VideoStats video_stats() {
   bool fresh = millis() - statAt < 3000;  // mirroring stopped: report zeros, not stale numbers
