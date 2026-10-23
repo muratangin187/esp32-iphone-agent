@@ -190,6 +190,8 @@ async def handle(e: Entry, m: dict):
         return await d.text(m["s"])
     if t == "key":
         return await d.key(m["k"])
+    if t == "status":
+        return await d.board_status()
     if t == "imove":
         return await d.live_move(float(m["dx"]), float(m["dy"]))
     if t == "ibtn":

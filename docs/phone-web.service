@@ -4,6 +4,8 @@ After=network-online.target iphone-screen.service
 
 [Service]
 WorkingDirectory=%h
+# The serial port belongs to `uucp`. A user service manager started before `usermod -aG uucp $USER` lacks the group
+# until the next login (or reboot): start the server from a fresh login shell until then.
 ExecStart=%h/.local/share/mise/installs/uv/latest/.mise-bins/uv run %h/Work/esp32-iphone-agent/hardware/tools/phone_web/server.py --port 8765
 Restart=always
 RestartSec=2

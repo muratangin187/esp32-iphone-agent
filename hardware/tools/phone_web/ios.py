@@ -105,6 +105,10 @@ class IPhoneDevice:
             self._live = [0.0, 0.0]
             await self._call(self.phone.live_move, dx, dy)
 
+    async def board_status(self):
+        """The ESP32's own status (opens the serial port): is the Bluetooth mouse connected to the phone?"""
+        return await self._call(lambda: __import__("json").loads(self.phone._cmd("status")))
+
     async def button(self, what: str):
         cmd = {"click": "click", "press": "press", "release": "release"}[what]
         return await self._call(self.phone._cmd, cmd)
