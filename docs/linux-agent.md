@@ -66,3 +66,31 @@ about (22, 21) px of 498×1080, then moves 0.78 px per unit, residual error abou
 - The relative scale was measured on one phone and tracking speed; run `iphone_calibrate` on a new one.
 - Only the phone's Bluetooth link uses the radio: the ESP32 takes no Wi-Fi, so there is nothing to join or configure
   on the board.
+
+## Web UI and one MCP for every phone
+
+`hardware/tools/phone_web/server.py` serves a page that shows the iPhone and every Android phone adb can see, and lets
+you use them from Chrome: click, drag, mouse-wheel scroll, keyboard, Home/Back/Recents. It runs as a user service
+(`docs/phone-web.service`, port 8765) on the computer the phones are connected to, and answers on localhost, the LAN
+and Tailscale. There is no password: it refuses a Host header that is not an IP, `localhost`, the machine's name or a
+`*.ts.net` name (DNS rebinding) and any cross-site request (`Origin` must equal `Host`).
+
+- **Android** uses scrcpy (`android.py`, protocol 5.0): H.264 over an adb forward, decoded to JPEG with PyAV, touch,
+  key, text and scroll injected through the control socket. Non-ASCII text (Turkish letters, emoji) is pasted through
+  the clipboard. 15-30 frames/s; scrcpy starts when someone watches and stops 30 s after the last viewer leaves.
+- **iPhone** shows UxPlay's frames (~5/s) and uses the Bluetooth mouse. Click mode: about 2-3 s for the first tap and
+  0.6-1.3 s for the next ones (the pointer position is tracked instead of homing into the corner each time; a
+  measurement that disagrees with the target by more than 10% is discarded and the next tap homes again). **Live
+  mouse** (button in the header) moves the iPhone's pointer by the browser mouse's motion, like a remote desktop.
+- The page's `/api/<id>/screenshot.jpg` and `POST /api/<id>/action` (the same JSON as the WebSocket) are what
+  `phone_mcp.py` uses: `claude mcp add phones -- uv run hardware/tools/phone_mcp.py` gives an agent
+  `phone_devices`, `phone_screenshot`, `phone_tap`, `phone_swipe`, `phone_scroll`, `phone_type`, `phone_key` and
+  `phone_home` for both phones. Only one process may own the ESP32's serial port, so with the web service running,
+  use `phone_mcp.py` instead of `iphone_mcp.py`.
+- Reach it from another machine with `ssh -L 8765:localhost:8765 host` (then http://localhost:8765), or open the port to
+  the LAN/Tailscale: `sudo ufw allow from 192.168.1.0/24 to any port 8765 proto tcp` and
+  `sudo ufw allow in on tailscale0 to any port 8765 proto tcp`.
+
+Known limits: the iPhone's *hardware keyboard layout* decides the letters (a Turkish Q layout makes the `i` key type
+`ı`; pick English (US) for the board's keyboard in Settings > General > Keyboard > Hardware Keyboard), and a long tap
+or a drag on the iPhone moves the pointer in two axis-aligned legs, so the path is not a straight line.

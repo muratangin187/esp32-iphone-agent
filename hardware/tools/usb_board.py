@@ -40,7 +40,7 @@ def find_port() -> str:
 
 class UsbBoard:
     def __init__(self, port: str | None = None):
-        self.s = serial.Serial(port or find_port(), 115200, timeout=0.2)
+        self.s = serial.Serial(port or find_port(), 115200, timeout=0.2, exclusive=True)  # one owner: web UI or MCP
         self.next_id = 1
         time.sleep(0.3)
         self.s.reset_input_buffer()

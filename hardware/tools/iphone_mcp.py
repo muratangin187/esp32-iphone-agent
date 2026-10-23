@@ -46,6 +46,9 @@ class Phone:
         self.board: UsbBoard | None = None
         self.lock = threading.RLock()
         self.cal = self._load_cal()
+        # where the pointer is believed to be: (fx, fy, time). Known after a verified tap, so the next tap can move
+        # from there instead of homing into the corner first (about 1 s instead of 3 s); None = unknown, home first.
+        self.pointer: tuple[float, float, float] | None = None
 
     # ---- setup
     def _load_cal(self) -> dict:
@@ -120,34 +123,48 @@ class Phone:
         c = self.cal
         return round((fx - c["x0"]) / c["kx"]), round((fy - c["y0"]) / c["ky"])
 
-    def move_to(self, fx: float, fy: float, verify: bool = True) -> dict:
+    def move_to(self, fx: float, fy: float, verify: bool = True, fast: bool = True) -> dict:
         """Put the pointer at the fractional position; returns the measured error in frame fractions."""
         fx, fy = min(max(fx, 0.03), 0.97), min(max(fy, 0.02), 0.98)
         with self.lock:
-            self._cmd("home")
-            time.sleep(0.3)
-            _, base = self.frame(after=0, timeout=2)  # pointer in the corner: the reference for the diff
-            ux, uy = self._units(fx, fy)
-            if uy > 0:
+            known = self.pointer if fast and self.pointer and time.time() - self.pointer[2] < 45 else None
+            self.pointer = None
+            if known is None:
+                self._cmd("home")
+                time.sleep(0.3)
+                cur = (self.cal["x0"], self.cal["y0"])  # the pointer's centre right after `home`
+            else:
+                cur = known[:2]
+            _, base = self.frame(after=0, timeout=2)  # the reference for the pointer diff
+            ux, uy = round((fx - cur[0]) / self.cal["kx"]), round((fy - cur[1]) / self.cal["ky"])
+            if uy:
                 self._cmd(f"move 0 {uy}")
-            if ux > 0:
+            if ux:
                 self._cmd(f"move {ux} 0")
             if not verify:
                 return {"verified": False}
-            return self._verify(fx, fy, base, last_moves_at=time.time())
+            info = self._verify(fx, fy, base, last_moves_at=time.time(), avoid=known[:2] if known else None)
+            if info.get("verified") and info.get("error"):
+                self.pointer = (fx - info["error"][0], fy - info["error"][1], time.time())
+            return info
 
-    def _verify(self, fx: float, fy: float, base: np.ndarray, last_moves_at: float) -> dict:
+    def _verify(self, fx: float, fy: float, base: np.ndarray, last_moves_at: float, avoid=None) -> dict:
+        # `avoid`: where the pointer was before the move, in frame fractions (its old spot also shows up in the diff)
         """Find the pointer by diffing against the frame taken right after `home`; nudge it if it is off."""
         prev, last, err = base, None, None
         for attempt in range(3):
             time.sleep(0.25)
             _, now = self.frame(after=last_moves_at, timeout=1.0)
             h, w = now.shape
+            if attempt == 0 and avoid:
+                last = (avoid[0] * w, avoid[1] * h)  # to pixels
             p = self._find_pointer(prev, now, avoid=last)
             if p is None:
                 return {"verified": False} if err is None else {"verified": True, "error": err}
             ex, ey = fx - p[0] / w, fy - p[1] / h
             err = [round(ex, 3), round(ey, 3)]
+            if abs(ex) > 0.1 or abs(ey) > 0.1:  # far off: the blob is probably not the pointer; do not chase it
+                return {"verified": False, "error": err}
             if (abs(ex) < 0.012 and abs(ey) < 0.008) or attempt == 2:
                 return {"verified": True, "error": err}
             cx, cy = round(ex / self.cal["kx"]), round(ey / self.cal["ky"])
@@ -215,12 +232,24 @@ class Phone:
                 self._cmd(f"move {dx} 0")
             time.sleep(0.12)
             self._cmd("release")
+            self.pointer = None
         return info
 
     def scroll(self, fx: float, fy: float, lines: int) -> None:
         with self.lock:
             self.move_to(fx, fy, verify=False)
+            self.pointer = None
             self._cmd(f"scroll {int(lines)} 0")
+
+    def live_move(self, dfx: float, dfy: float) -> None:
+        """Relative pointer motion in frame fractions, for driving the pointer like a mouse (no verification)."""
+        ux, uy = round(dfx / self.cal["kx"]), round(dfy / self.cal["ky"])
+        with self.lock:
+            self.pointer = None
+            if uy:
+                self._cmd(f"move 0 {uy}")
+            if ux:
+                self._cmd(f"move {ux} 0")
 
 
 # ---------------------------------------------------------------- MCP

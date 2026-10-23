@@ -1,0 +1,12 @@
+[Unit]
+Description=Phone web UI and API (iPhone via ESP32 + UxPlay, Android via scrcpy)
+After=network-online.target iphone-screen.service
+
+[Service]
+WorkingDirectory=%h
+ExecStart=%h/.local/share/mise/installs/uv/latest/.mise-bins/uv run %h/Work/esp32-iphone-agent/hardware/tools/phone_web/server.py --port 8765
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

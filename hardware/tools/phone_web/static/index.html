@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telefonlar</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1d2026; --line:#2c3038; --fg:#e8eaed; --dim:#9aa0a6; --acc:#6ea8fe; --bad:#ff7b72; --ok:#56d364; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header, footer { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--panel); border-color: var(--line); flex-wrap: wrap; }
+  header { border-bottom: 1px solid var(--line); }
+  footer { border-top: 1px solid var(--line); }
+  button, input { font: inherit; color: inherit; background: #262a31; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--acc); }
+  button.on, button.tab.on { background: var(--acc); color: #0b1d36; border-color: var(--acc); }
+  input { flex: 1; min-width: 160px; }
+  .spacer { flex: 1; }
+  #status { color: var(--dim); font-size: 12px; text-align: right; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); display: inline-block; margin-right: 6px; }
+  #dot.ok { background: var(--ok); } #dot.bad { background: var(--bad); }
+  main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 10px; position: relative; }
+  #stage { position: relative; max-height: 100%; max-width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100%; max-height: 100%; border-radius: 14px; background: #000; box-shadow: 0 6px 30px #0008; cursor: crosshair; touch-action: none; outline: none; }
+  #msg { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 10px; max-width: 80%; text-align: center; pointer-events: none; opacity: 0; transition: opacity .2s; z-index: 5; }
+  #msg.show { opacity: 1; } #msg.err { color: var(--bad); }
+  .ripple { position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px; border-radius: 50%; border: 3px solid var(--acc); pointer-events: none; animation: rip .5s ease-out forwards; }
+  @keyframes rip { from { transform: scale(.3); opacity: 1; } to { transform: scale(1.4); opacity: 0; } }
+  #busy { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); background: #000c; padding: 4px 12px; border-radius: 99px; font-size: 12px; display: none; }
+  #hint { color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="tabs"></span>
+  <button id="liveBtn" title="Fareyi oynattıkça iPhone'daki imleç de oynar (uzaktan masaüstü gibi)" style="display:none">Canlı fare</button>
+  <span class="spacer"></span>
+  <span id="status"><span id="dot"></span><span id="statusText">bağlanıyor…</span></span>
+</header>
+<main>
+  <div id="msg"></div>
+  <div id="stage">
+    <canvas id="screen" tabindex="0" width="360" height="780"></canvas>
+    <div id="busy">işleniyor…</div>
+  </div>
+</main>
+<footer>
+  <button data-key="home">Ana ekran</button>
+  <button data-key="back" class="android">Geri</button>
+  <button data-key="recents" class="android">Son uygulamalar</button>
+  <button data-key="notifications" class="android">Bildirimler</button>
+  <button data-key="power" class="android">Güç</button>
+  <input id="textbox" placeholder="Yazı gönder (Enter): telefondaki seçili alana yazılır" autocomplete="off">
+  <button id="sendText">Gönder</button>
+  <span id="hint"></span>
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const canvas = $('#screen'), ctx = canvas.getContext('2d');
+let ws, devices = [], cur = null, retry = null, live = false;
+let latest = null, drawPending = false, frames = 0, lastFrameAt = 0, size = [0, 0];
+let nextId = 1; const pending = new Map();
+
+// ------------------------------------------------------------ devices and connection
+async function loadDevices() {
+  try { devices = await (await fetch('/api/devices')).json(); } catch (e) { setStatus('sunucuya ulaşılamıyor', 'bad'); return; }
+  $('#tabs').innerHTML = '';
+  for (const d of devices) {
+    const b = document.createElement('button'); b.className = 'tab'; b.textContent = d.name; b.dataset.id = d.id;
+    b.onclick = () => select(d.id); $('#tabs').appendChild(b);
+  }
+  const want = localStorage.lastDevice;
+  const pick = devices.find(d => d.id === want) || devices[0];
+  if (pick) select(pick.id); else setStatus('cihaz yok', 'bad');
+}
+
+function select(id) {
+  cur = devices.find(d => d.id === id); localStorage.lastDevice = id;
+  document.querySelectorAll('#tabs .tab').forEach(b => b.classList.toggle('on', b.dataset.id === id));
+  const android = cur.kind === 'android';
+  document.querySelectorAll('.android').forEach(b => b.style.display = android ? '' : 'none');
+  $('#liveBtn').style.display = android ? 'none' : '';
+  $('#hint').textContent = android ? 'tıkla · sürükle · tekerlekle kaydır · yazı yaz'
+    : (live ? 'canlı fare: fareyi oynat, tıkla' : 'tıkla (1-3 sn) · sürükle = kaydır · yazı yaz (yalnız ASCII)');
+  latest = null; size = [0, 0]; ctx.clearRect(0, 0, canvas.width, canvas.height);
+  connect();
+}
+
+function connect() {
+  if (ws) { ws.onclose = null; ws.close(); }
+  clearTimeout(retry);
+  setStatus('bağlanıyor…', '');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/' + cur.id);
+  ws.binaryType = 'blob';
+  ws.onmessage = ev => typeof ev.data === 'string' ? onJson(JSON.parse(ev.data)) : onFrame(ev.data);
+  ws.onclose = () => { setStatus('bağlantı koptu, yeniden deneniyor…', 'bad'); retry = setTimeout(connect, 2000); };
+}
+
+function onJson(m) {
+  if (m.type === 'state') {
+    if (m.size && m.size[0]) size = m.size;
+    let s = `${m.name}`;
+    if (m.size && m.size[0]) s += ` · ${m.size[0]}×${m.size[1]}`;
+    s += ` · ${m.fps || 0} kare/sn`;
+    if (m.kind === 'ios' && m.mirroring === false) s += ' · yansıtma kapalı: iPhone\'da Ekran Yansıtma → iPhone Agent';
+    if (m.starting) s = m.name + ' başlatılıyor…';
+    setStatus(s, m.error ? 'bad' : (m.kind === 'ios' && m.mirroring === false ? 'bad' : 'ok'));
+  } else if (m.type === 'error') {
+    toast(m.msg, true); if (m.id) done(m.id);
+  } else if (m.type === 'done') { done(m.id); }
+}
+
+function setStatus(t, cls) { $('#statusText').textContent = t; $('#dot').className = cls || ''; }
+let toastT;
+function toast(t, err) { const e = $('#msg'); e.textContent = t; e.className = 'show' + (err ? ' err' : ''); clearTimeout(toastT); toastT = setTimeout(() => e.className = '', err ? 4500 : 1800); }
+
+// ------------------------------------------------------------ drawing
+async function onFrame(blob) {
+  const bmp = await createImageBitmap(blob);
+  if (latest) latest.close();
+  latest = bmp; frames++; lastFrameAt = performance.now();
+  if (!drawPending) { drawPending = true; requestAnimationFrame(draw); }
+}
+function draw() {
+  drawPending = false;
+  if (!latest) return;
+  if (canvas.width !== latest.width || canvas.height !== latest.height) { canvas.width = latest.width; canvas.height = latest.height; }
+  ctx.drawImage(latest, 0, 0);
+}
+
+// ------------------------------------------------------------ input
+function send(m, track) {
+  if (!ws || ws.readyState !== 1) { toast('bağlı değil', true); return; }
+  if (track) { m.id = nextId++; pending.set(m.id, performance.now()); $('#busy').style.display = 'block'; }
+  ws.send(JSON.stringify(m));
+}
+function done(id) { pending.delete(id); if (!pending.size) $('#busy').style.display = 'none'; }
+function pos(e) { const r = canvas.getBoundingClientRect(); return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)), px: e.clientX - r.left, py: e.clientY - r.top }; }
+function ripple(p) { const d = document.createElement('div'); d.className = 'ripple'; const r = canvas.getBoundingClientRect(), s = $('#stage').getBoundingClientRect(); d.style.left = (r.left - s.left + p.px) + 'px'; d.style.top = (r.top - s.top + p.py) + 'px'; $('#stage').appendChild(d); setTimeout(() => d.remove(), 600); }
+
+let down = null, lastMove = 0, liveAcc = { dx: 0, dy: 0 }, liveT = null, livePrev = null;
+canvas.addEventListener('pointerdown', e => {
+  if (!cur) return; canvas.focus(); try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  const p = pos(e); down = { ...p, t: performance.now(), moved: false };
+  if (cur.kind === 'android') send({ t: 'touch', a: 'down', x: p.x, y: p.y });
+  else if (live) { livePrev = p; send({ t: 'ibtn', b: 'press' }); }
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pos(e);
+  if (cur && cur.kind === 'ios' && live) {  // relative: the pointer follows the mouse even without a button
+    if (livePrev) { liveAcc.dx += p.x - livePrev.x; liveAcc.dy += p.y - livePrev.y; if (!liveT) liveT = setTimeout(flushLive, 33); }
+    livePrev = p; return;
+  }
+  if (!down) return;
+  if (Math.hypot(p.x - down.x, p.y - down.y) > 0.012) down.moved = true;
+  if (cur.kind === 'android' && performance.now() - lastMove > 12) { lastMove = performance.now(); send({ t: 'touch', a: 'move', x: p.x, y: p.y }); }
+});
+function flushLive() { liveT = null; if (Math.abs(liveAcc.dx) + Math.abs(liveAcc.dy) > 1e-4) { send({ t: 'imove', dx: liveAcc.dx, dy: liveAcc.dy }); liveAcc = { dx: 0, dy: 0 }; } }
+canvas.addEventListener('pointerup', e => {
+  if (!down) return; const p = pos(e), held = performance.now() - down.t, d = down; down = null;
+  ripple(p);
+  if (cur.kind === 'android') { send({ t: 'touch', a: 'up', x: p.x, y: p.y }); return; }
+  if (live) { send({ t: 'ibtn', b: 'release' }); return; }
+  if (d.moved) send({ t: 'swipe', x1: d.x, y1: d.y, x2: p.x, y2: p.y }, true);
+  else send({ t: 'tap', x: p.x, y: p.y, hold: held > 500 ? Math.round(held) : 0 }, true);
+});
+canvas.addEventListener('pointercancel', () => { if (down && cur.kind === 'android') send({ t: 'touch', a: 'up', x: down.x, y: down.y }); down = null; });
+canvas.addEventListener('wheel', e => { if (!cur) return; e.preventDefault(); const p = pos(e); send({ t: 'scroll', x: p.x, y: p.y, dy: e.deltaY / 100 }, cur.kind === 'ios'); }, { passive: false });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// keyboard: printable keys become text (batched), a few special keys are sent as keys
+let textBuf = '', textT = null;
+function typeText(s) { textBuf += s; clearTimeout(textT); textT = setTimeout(() => { send({ t: 'text', s: textBuf }, true); textBuf = ''; }, 40); }
+const SPECIAL = { Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: null, ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Delete: 'delete', Home: 'move_home', End: 'move_end', PageUp: 'page_up', PageDown: 'page_down' };
+document.addEventListener('keydown', e => {
+  if (!cur || e.target.tagName === 'INPUT') return;
+  if (e.ctrlKey || e.metaKey) return; // paste is handled by the paste event; the browser keeps its own shortcuts
+  if (e.key in SPECIAL) {
+    let k = SPECIAL[e.key];
+    if (e.key === 'Escape') k = cur.kind === 'android' ? 'back' : 'esc';
+    if (k) { send({ t: 'key', k }, cur.kind === 'ios'); e.preventDefault(); }
+  } else if (e.key.length === 1) { typeText(e.key); e.preventDefault(); }
+});
+document.addEventListener('paste', e => { if (!cur || e.target.tagName === 'INPUT') return; const s = e.clipboardData.getData('text'); if (s) { send({ t: 'text', s }, true); e.preventDefault(); } });
+
+document.querySelectorAll('footer [data-key]').forEach(b => b.onclick = () => send({ t: 'key', k: b.dataset.key }, cur && cur.kind === 'ios'));
+function sendBox() { const s = $('#textbox').value; if (s) { send({ t: 'text', s }, true); $('#textbox').value = ''; } }
+$('#sendText').onclick = sendBox;
+$('#textbox').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendBox(); } });
+$('#liveBtn').onclick = () => { live = !live; $('#liveBtn').classList.toggle('on', live); if (cur) select(cur.id); };
+
+setInterval(() => { if (ws && ws.readyState === 1 && lastFrameAt && performance.now() - lastFrameAt > 8000 && cur && cur.kind === 'android') { /* the screen is simply static */ } }, 4000);
+loadDevices();
+</script>
+</body>
+</html>
