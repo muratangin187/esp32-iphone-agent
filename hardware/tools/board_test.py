@@ -252,9 +252,15 @@ async def main():
     ap.add_argument("--load", choices=["bench", "stream"], default="bench",
                     help="`stress`: synthetic `bench --kb` filler, or `stream on` (needs mirroring)")
     ap.add_argument("--every", type=float, default=0.2, help="`stress`: seconds between ping/move commands")
+    ap.add_argument("--pair", action="store_true", help="bond with the board first (BlueZ; only the encrypted `net` characteristic needs it). A bonded Linux host also binds the board's Bluetooth HID service")
     a = ap.parse_args()
 
     async with BleakClient(await find_board(a.scan), timeout=20) as client:
+        if a.pair:  # BlueZ does not pair on its own; only the encrypted `net` characteristic needs it
+            try:
+                await client.pair()  # Just Works bonding; no-op if already bonded
+            except Exception as e:
+                print("pair:", repr(e))
         b = Board(client)
         await b.start()
         print("mtu:", client.mtu_size)
